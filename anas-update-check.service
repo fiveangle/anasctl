@@ -1,0 +1,12 @@
+[Unit]
+Description=Check GitHub for a newer ANAS release
+Wants=network-online.target
+After=network-online.target pve-cluster.service
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/anas-manager/monitor check --notify
+StateDirectory=anas-manager
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=90s

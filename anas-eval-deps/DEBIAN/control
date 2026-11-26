@@ -1,0 +1,7 @@
+Package: anas-eval-deps
+Version: 0.4.6
+Architecture: all
+Maintainer: Local Proxmox administrator <root@localhost>
+Depends: nodejs (>= 20), acl, mdadm, btrfs-progs, samba, samba-common-bin, nfs-kernel-server, targetcli-fb, python3-rtslib-fb, rclone, attr
+Description: Local dependency metapackage for ANAS on Proxmox VE
+ Keeps the Debian packages required by the reviewed ANAS release together.

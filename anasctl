@@ -1,0 +1,1177 @@
+#!/usr/bin/python3
+"""Install, remove, and monitor ANAS on this Proxmox VE node."""
+
+import argparse
+import fcntl
+from functools import cache
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+
+REPO = "ccebelenski/anas"
+STATE = Path("/var/lib/anas-manager")
+VERSION_FILE = Path("/opt/anas/VERSION")
+METAPACKAGE = "anas-eval-deps"
+REVIEWED_RELEASE = "0.4.6"
+REVIEWED_DIGEST = "198413d99e76fa756e6f47bab74778cfbcb470701729998c0307912273636f0c"
+SOURCE = Path(__file__).resolve().parent
+SYSTEMD = Path("/etc/systemd/system")
+TEMPLATES = Path("/usr/share/pve-manager/templates/default")
+LEGACY_TEMPLATES = Path("/etc/pve/notification-templates/default")
+TIMER = "anas-update-check.timer"
+CHECK_SERVICE = "anas-update-check.service"
+UPDATE_EVENT = "anas-update-available"
+UPDATE_SEVERITY = "info"
+PROXY = Path("/usr/share/perl5/PVE/APIServer/AnyEvent.pm")
+UI = Path("/usr/share/pve-manager/index.html.tpl")
+APP_PATHS = (
+    VERSION_FILE.parent, Path("/etc/default/anas"), Path("/etc/apt/apt.conf.d/80anas-pve-integration"),
+    Path("/usr/share/pve-manager/js/anas.js"), Path("/usr/share/anas/perl/AnasProxy.pm"),
+    Path("/usr/local/bin/anas-md-event"), Path("/usr/local/bin/anas-cache-event"),
+    Path("/etc/udev/rules.d/99-anas-cache.rules"), SYSTEMD / "anas.service", SYSTEMD / "anasd.service",
+    SYSTEMD / "anas-recycle.service", SYSTEMD / "anas-recycle.timer",
+    SYSTEMD / "rtslib-fb-targetctl.service.d/anas-ordering.conf",
+)
+MDADM_CONFIG = Path("/etc/mdadm/mdadm.conf")
+FEATURE_FILES = {
+    "samba": ("/etc/samba", "/var/lib/samba/private/passdb.tdb", "/var/lib/samba/usershares"),
+    "nfs-kernel-server": ("/etc/exports", "/etc/exports.d"),
+    "targetcli-fb": ("/etc/rtslib-fb-target",),
+    "mdadm": ("/etc/mdadm/mdadm.conf", "/etc/anas/ahr", "/proc/mdstat", "/etc/fstab"),
+    "btrfs-progs": ("/etc/anas/ahr", "/etc/fstab"),
+    "rclone": ("/etc/anas/rclone.conf", "/root/.config/rclone/rclone.conf"),
+}
+APT = ["apt-get", "-o", "APT::Get::AutomaticRemove=false", "-o", "APT::Get::Purge=false"]
+LOCK_FD = None
+VERSION = re.compile(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}")
+CURL = [
+    "curl", "--disable", "--fail", "--silent", "--show-error", "--location",
+    "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "10",
+    "--max-time", "60",
+]
+
+
+def output(*command):
+    return subprocess.check_output(command, text=True, env={**os.environ, "LC_ALL": "C"})
+
+
+def compare_version(version):
+    if not VERSION.fullmatch(version):
+        raise ValueError(f"Expected an ANAS release version such as 0.4.6, got {version!r}")
+    return tuple(map(int, version.split(".")))
+
+
+def release_info(version=None):
+    endpoint = f"tags/v{version}" if version else "latest"
+    release = json.loads(output(*CURL, f"https://api.github.com/repos/{REPO}/releases/{endpoint}"))
+    tag = release["tag_name"]
+    if release["draft"] or release["prerelease"] or not tag.startswith("v"):
+        raise ValueError(f"Expected a stable ANAS release, got {tag!r}")
+    available = tag[1:]
+    compare_version(available)
+    if version and available != version:
+        raise ValueError(f"GitHub returned {available} for requested version {version}")
+    return available, release["assets"]
+
+
+def release_url(version):
+    return f"https://github.com/{REPO}/releases/tag/v{version}"
+
+
+def release_asset(version, assets):
+    name = f"anas-{version}.tar.gz"
+    url = f"https://github.com/{REPO}/releases/download/v{version}/{name}"
+    matching = [asset for asset in assets if asset["name"] == name]
+    if len(matching) != 1 or matching[0]["browser_download_url"] != url:
+        raise ValueError(f"Expected the ANAS release asset {name}")
+    digest = matching[0].get("digest") or ""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError(f"GitHub did not publish a SHA-256 digest for {name}")
+    return name, url, digest[7:]
+
+
+def fetch(version, destination, expected_digest=None):
+    compare_version(version)
+    _, assets = release_info(version)
+    directory = f"anas-{version}"
+    name, url, digest = release_asset(version, assets)
+    if expected_digest is not None and digest != expected_digest:
+        raise ValueError(f"The published {name} asset differs from the reviewed release")
+
+    destination = destination.resolve()
+    final = destination / directory
+    if final.exists() or final.is_symlink():
+        raise ValueError(f"Release directory already exists at {final}")
+    with tempfile.TemporaryDirectory(prefix=".anas-release-", dir=destination) as temporary:
+        work = Path(temporary)
+        archive = work / name
+        subprocess.run([*CURL, "--output", archive, url], check=True)
+        with archive.open("rb") as contents:
+            if hashlib.file_digest(contents, "sha256").hexdigest() != digest:
+                raise ValueError(f"SHA-256 mismatch for {name}")
+        with tarfile.open(archive, mode="r:gz") as tar:
+            members = tar.getmembers()
+            if any(Path(member.name).parts[:1] != (directory,) or ".." in Path(member.name).parts for member in members):
+                raise ValueError(f"Unexpected archive layout in {name}")
+            tar.extractall(work, members=members, filter="data")
+        extracted = work / directory
+        required = ["VERSION", "install.sh", "uninstall.sh", "app/packages/pve-integration/uninstall.sh"]
+        if not all((extracted / file).is_file() for file in required):
+            raise ValueError(f"Missing installer files in {name}")
+        if (extracted / "VERSION").read_text().strip() != version:
+            raise ValueError("The archive VERSION does not match the requested release")
+        (extracted / ".github-asset-sha256").write_text(f"{digest}  {name}\n")
+        extracted.rename(final)
+    print(f"Staged ANAS {version} at {final}")
+
+
+def enqueue_update(installed, available):
+    notifier = """
+        my ($type, $severity, $installed, $available, $url) = @ARGV;
+        my $host = PVE::INotify::nodename();
+        PVE::Notify::notify($severity, $type, {
+            hostname => $host, installed => $installed,
+            available => $available, release_url => $url,
+        }, { type => $type, hostname => $host });
+    """
+    subprocess.run([
+        "perl", "-MPVE::Notify", "-e", notifier, "--", UPDATE_EVENT, UPDATE_SEVERITY,
+        installed, available, release_url(available),
+    ], check=True)
+
+
+def check(notify, resend=False):
+    try:
+        installed = VERSION_FILE.read_text().strip()
+    except FileNotFoundError:
+        print("ANAS is not installed at /opt/anas. Skipping update check.")
+        return
+    installed_version = compare_version(installed)
+    can_notify = notification_diagnostics() if notify else False
+    available, assets = release_info()
+    if compare_version(available) <= installed_version:
+        print(f"ANAS {installed} is installed. Latest GitHub release is {available}.")
+        return
+    release_asset(available, assets)
+    print(f"ANAS {installed} is installed. Version {available} is available at {release_url(available)}.")
+    if not can_notify:
+        return
+
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp = STATE / "last-notified"
+    with (STATE / "notify.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = stamp.read_text().strip() if stamp.exists() else None
+        if not resend and previous is not None and compare_version(previous) >= compare_version(available):
+            print(f"A notification for ANAS {available} or a newer release was already submitted.")
+            return
+        enqueue_update(installed, available)
+        latest_notified = max(previous or available, available, key=compare_version)
+        atomic_write(stamp, f"{latest_notified}\n".encode())
+        print(f"Submitted the ANAS {available} notice to Proxmox.")
+
+
+def installed_packages(canonical):
+    packages = output("dpkg-query", "-W", "-f=${db:Status-Status}\t${binary:Package}\n")
+    return {canonical(line.split("\t")[1]) for line in packages.splitlines() if line.startswith("installed\t")}
+
+
+@cache
+def native_architecture():
+    return output("dpkg", "--print-architecture").strip()
+
+
+def package_name(package):
+    return package.removesuffix(":" + native_architecture()).removesuffix(":all")
+
+
+def tracked_packages(scope):
+    baseline = set((scope / "initial-packages").read_text().splitlines())
+    if not baseline or METAPACKAGE in baseline:
+        raise ValueError("The original package inventory is invalid. Review the APT history before cleanup.")
+    tracked = set()
+    for receipt in scope.glob("apt-install-*.json"):
+        tracked.update(read_json(receipt))
+    return tracked - baseline
+
+
+def dependency_cleanup(scope):
+    installed = installed_packages(package_name)
+    automatic = {package_name(package) for package in output("apt-mark", "showauto").splitlines()}
+    tracked = tracked_packages(scope)
+
+    anchors = [METAPACKAGE] if METAPACKAGE in installed else []
+    # Scope the result to packages ANAS added. Soft relationships from packages
+    # already on the host should not prevent restoring that baseline.
+    solver = output(
+        "apt-get", "--simulate", "-o", "APT::AutoRemove::RecommendsImportant=false",
+        "-o", "APT::AutoRemove::SuggestsImportant=false", "autoremove", *anchors,
+    )
+    orphans = {package_name(package) for package in re.findall(r"^Remv (\S+)", solver, flags=re.MULTILINE)}
+    eligible = tracked & installed & automatic & orphans
+    targets = sorted(eligible | set(anchors))
+    kept = sorted((tracked & installed) - set(targets))
+    if kept:
+        print("Tracked packages to retain:", ", ".join(kept))
+    if not targets:
+        return []
+    explicit = output(*APT, "--simulate", "remove", *targets)
+    removed = {package_name(package) for package in re.findall(r"^Remv (\S+)", explicit, flags=re.MULTILINE)}
+    if removed != set(targets) or re.search(r"^(Inst|Conf|Purg) ", explicit, flags=re.MULTILINE):
+        raise ValueError("The scoped APT plan has additional changes. Review the package state before removing anything.")
+    return targets
+
+
+def atomic_write(path, data, mode=0o600):
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+        temporary = Path(temp.name)
+        try:
+            os.fchmod(temp.fileno(), mode)
+            temp.write(data)
+            temp.flush()
+            os.fsync(temp.fileno())
+            temporary.replace(path)
+            sync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_json(path, value):
+    atomic_write(path, (json.dumps(value, sort_keys=True, indent=2) + "\n").encode())
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def file_digest(path):
+    with path.open("rb") as contents:
+        return hashlib.file_digest(contents, "sha256").hexdigest()
+
+
+def checked_run(*command, cwd=None, env=None, log=None):
+    inherited = () if LOCK_FD is None else (LOCK_FD,)
+    kwargs = dict(cwd=cwd, env=env, check=True, stdin=subprocess.DEVNULL, pass_fds=inherited)
+    if log is None:
+        subprocess.run(command, **kwargs)
+        return
+    with log.open("ab") as stream:
+        stream.write((shlex.join(command) + "\n").encode())
+        stream.flush()
+        try:
+            subprocess.run(command, **kwargs, stdout=stream, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"{command[0]} failed with exit {error.returncode}. See {log}") from error
+
+
+def apt_install_plan(*debs):
+    plan = output(*APT, "--simulate", "--no-install-recommends", "--no-remove", "install", *map(str, debs))
+    installs = {}
+    for line in plan.splitlines():
+        if line.startswith("Inst "):
+            match = re.match(r"^Inst (\S+) \((\S+)", line)
+            require(match is not None, f"APT proposes changing an existing package: {line}")
+            installs[package_name(match[1])] = match[2]
+        elif line.startswith(("Remv ", "Purg ")):
+            raise RuntimeError(f"APT proposes removing an existing package: {line}")
+        elif line.startswith("Conf "):
+            require(package_name(line.split()[1]) in installs, f"APT proposes configuring an existing package: {line}")
+    return plan, installs
+
+
+def apt_guard(plan_path):
+    plan = read_json(plan_path)
+    header = sys.stdin.readline().strip()
+    require(header == "VERSION 3", f"Unsupported APT transaction protocol {header!r}")
+    for line in sys.stdin:
+        if not line.strip():
+            break
+    observed = set()
+    for line in sys.stdin:
+        package, old, old_arch, _, _, new, new_arch, _, action = line.split(maxsplit=8)
+        action = action.strip()
+        arch = new_arch if old == "-" else old_arch
+        name = package_name(f"{package}:{arch}")
+        if plan["mode"] == "install":
+            require(name in plan["packages"] and new == plan["packages"][name], f"Unexpected APT install action: {line.strip()}")
+            require(old == "-" and action != "**REMOVE**", f"APT would change an existing package: {line.strip()}")
+            if action != "**CONFIGURE**":
+                observed.add(name)
+        else:
+            require(action == "**REMOVE**" and name in plan["packages"], f"Unexpected APT removal action: {line.strip()}")
+            require(old == plan["packages"][name], f"APT would remove a different version of {name}")
+            observed.add(name)
+    require(observed == set(plan["packages"]), "APT's live transaction differs from the verified plan")
+    if plan["mode"] == "install":
+        write_json(Path(plan["receipt"]), sorted(observed))
+
+
+def apply_apt(scope, mode, packages, *args):
+    request = scope / "apt-guard.json"
+    transaction = f"apt-{mode}-{time.time_ns()}"
+    write_json(request, {"mode": mode, "packages": packages, "receipt": str(scope / f"{transaction}.json")})
+    hook = scope / "apt-guard"
+    command = shlex.join(["/usr/bin/python3", str(scope / "manager"), "_apt-guard", str(request)])
+    atomic_write(hook, f"#!/bin/sh\nexec {command}\n".encode(), 0o700)
+    log = scope / f"{transaction}.log"
+    checked_run(
+        *APT, "--assume-yes", "-o", "DPkg::Lock::Timeout=60",
+        "-o", "DPkg::Options::=--force-confold",
+        "-o", "APT::Keep-Downloaded-Packages=true",
+        "-o", f"Dir::Log::History={log}", "-o", f"DPkg::Pre-Install-Pkgs::={hook}",
+        "-o", f"DPkg::Tools::Options::{hook}::Version=3", *args,
+        env={**os.environ, "LC_ALL": "C", "DEBIAN_FRONTEND": "noninteractive"},
+        log=scope / "lifecycle.log",
+    )
+
+
+def active(unit):
+    result = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, check=False)
+    require(result.returncode in {0, 3, 4} and result.stdout.strip(), f"Cannot read systemd state for {unit}: {result.stderr.strip()}")
+    return result.returncode == 0
+
+
+def enabled(unit):
+    result = subprocess.run(["systemctl", "is-enabled", unit], capture_output=True, text=True, check=False,
+                            env={**os.environ, "LC_ALL": "C"})
+    state = result.stdout.strip()
+    if not state and result.returncode in {1, 4} and "No such file or directory" in result.stderr:
+        return False
+    require(state and result.returncode in {0, 1, 4}, f"Cannot read systemd enablement for {unit}: {result.stderr.strip()}")
+    return state in {"enabled", "enabled-runtime"}
+
+
+def local_http(path, *options):
+    result = subprocess.run(
+        ["curl", "--disable", "--fail", "--silent", "--show-error", "--noproxy", "*",
+         "--max-time", "5", *options, path],
+        capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"},
+    )
+    if result.returncode:
+        reason = result.stderr.strip() or f"curl exited with status {result.returncode}"
+        raise RuntimeError(f"Probe of {path} failed: {reason}")
+    return result.stdout
+
+
+def daemon_json(endpoint):
+    return json.loads(local_http(f"http://localhost/v1/{endpoint}", "--unix-socket", "/run/anas/anasd.sock"))
+
+
+@cache
+def proxy_urls():
+    script = "print(PVE::APIServer::Utils::read_proxy_config('pveproxy')->{LISTEN_IP} // '');"
+    listen = output("perl", "-MPVE::APIServer::Utils", "-e", script).strip()
+    if not listen or listen == "::":
+        return ("https://127.0.0.1:8006", "https://[::1]:8006")
+    address = ipaddress.ip_address(listen)
+    if address.version == 4:
+        return (f"https://{address if not address.is_unspecified else '127.0.0.1'}:8006",)
+    return (f"https://[{str(address).replace('%', '%25')}]:8006",)
+
+
+def proxy_health():
+    require(active("pveproxy.service"), "pveproxy is not active")
+    errors = []
+    for base in proxy_urls():
+        try:
+            require("Proxmox" in local_http(f"{base}/", "--insecure"), f"Proxmox web UI did not answer at {base}")
+            return base
+        except RuntimeError as error:
+            errors.append(str(error))
+    raise RuntimeError(" ".join(errors))
+
+
+def app_health(version):
+    proxy = proxy_health()
+    require(VERSION_FILE.read_text().strip() == version, "Installed ANAS version differs from the requested version")
+    for unit in ("anas.service", "anasd.service", "anas-recycle.timer"):
+        require(active(unit) and enabled(unit), f"{unit} is not active and enabled")
+    daemon = daemon_json("health")
+    require(daemon["status"] == "ok" and daemon["version"] == version, "The ANAS daemon health check failed")
+    gateway = json.loads(local_http(f"{proxy}/anas/installed", "--insecure"))
+    require(gateway["name"] == "anas" and gateway["version"] == version, "ANAS is not reachable through pveproxy")
+    require("/pve2/js/anas.js" in UI.read_text() and "# >>> ANAS proxy hook" in PROXY.read_text(),
+            "The Proxmox integration is incomplete")
+
+
+def retry_health(check):
+    attempts = 10
+    for attempt in range(1, attempts + 1):
+        try:
+            check()
+            if attempt > 1:
+                print(f"Health checks passed after {attempt} attempts.", flush=True)
+            return
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+            if attempt == attempts:
+                raise RuntimeError(f"Health checks failed after {attempts} attempts. {error}") from error
+            time.sleep(1)
+
+
+def app_traces():
+    paths = [str(path) for path in APP_PATHS if os.path.lexists(path)]
+    for name in ("ahr", "backup", "snapshot", "replication", "cloud", "integration"):
+        for suffix in ("subject", "body"):
+            template = TEMPLATES / f"anas-{name}-{suffix}.txt.hbs"
+            if os.path.lexists(template):
+                paths.append(str(template))
+    if "/pve2/js/anas.js" in UI.read_text():
+        paths.append(str(UI))
+    if "# >>> ANAS proxy hook" in PROXY.read_text():
+        paths.append(str(PROXY))
+    return paths
+
+
+def verify_app_removed():
+    traces = app_traces()
+    require(not traces, f"ANAS artifacts remain: {', '.join(traces)}")
+    require(not schedule_units(), "ANAS schedule unit files remain after removal")
+    for unit in ("anas.service", "anasd.service", "anas-recycle.timer", "anas-recycle.service"):
+        require(not active(unit) and not enabled(unit), f"{unit} is still active or enabled")
+    retry_health(proxy_health)
+
+
+def app_script(scope, name):
+    release = scope / f"anas-{REVIEWED_RELEASE}"
+    guard = scope / "upstream-commands"
+    guard.mkdir(exist_ok=True)
+    for command in ("apt", "apt-get", "dpkg"):
+        atomic_write(guard / command, b"#!/bin/sh\necho 'ANAS attempted an unmanaged package change' >&2\nexit 1\n", 0o700)
+    automatic_attr = "attr" in output("apt-mark", "showauto", "attr").splitlines()
+    options = ["--yes"] if name == "install.sh" else []
+    try:
+        checked_run("/bin/bash", name, *options, cwd=release,
+                    env={"PATH": f"{guard}:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LC_ALL": "C"},
+                    log=scope / "lifecycle.log")
+    finally:
+        if name == "install.sh" and automatic_attr:
+            checked_run("apt-mark", "auto", "attr")
+            require("attr" in output("apt-mark", "showauto", "attr").splitlines(), "Could not restore the original attr APT mark")
+
+
+def remove_app(scope):
+    app_script(scope, "uninstall.sh")
+    integration_remains = (
+        "# >>> ANAS proxy hook" in PROXY.read_text() or "/pve2/js/anas.js" in UI.read_text()
+        or Path("/etc/apt/apt.conf.d/80anas-pve-integration").exists()
+    )
+    if integration_remains:
+        app_script(scope, "app/packages/pve-integration/uninstall.sh")
+    verify_app_removed()
+
+
+def fingerprint(paths):
+    entries = {}
+    for name in paths:
+        path = Path(name)
+        candidates = [path, *sorted(path.rglob("*"))] if path.is_dir() else [path]
+        for entry in candidates:
+            try:
+                metadata = entry.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    entries[str(entry)] = ["link", os.readlink(entry), file_digest(entry) if entry.is_file() else None]
+                elif stat.S_ISREG(metadata.st_mode):
+                    entries[str(entry)] = file_digest(entry)
+                else:
+                    entries[str(entry)] = stat.S_IFMT(metadata.st_mode)
+            except FileNotFoundError:
+                entries[str(entry)] = None
+    return entries
+
+
+def feature_state():
+    state = {name: fingerprint(paths) for name, paths in FEATURE_FILES.items()}
+    live = Path("/sys/kernel/config/target/iscsi")
+    if live.is_dir():
+        state["targetcli-fb"][str(live)] = sorted(entry.name for entry in live.iterdir())
+    return state
+
+
+def package_health():
+    audit = output("dpkg", "--audit").strip()
+    require(not audit, f"dpkg reports an incomplete package operation:\n{audit}")
+    output(*APT, "--simulate", "check")
+
+
+def platform_preflight():
+    version = output("dpkg-query", "-W", "-f=${Version}", "pve-manager").strip()
+    require(re.match(r"^(?:[0-9]+:)?9\.3(?:[.+~\-]|$)", version),
+            f"This manager release supports Proxmox VE 9.3.x. Found pve-manager {version}.")
+
+
+def build_metapackage(directory):
+    source = SOURCE / METAPACKAGE
+    deb = directory / f"{METAPACKAGE}_{REVIEWED_RELEASE}_all.deb"
+    checked_run("dpkg-deb", "--build", "--root-owner-group", str(source), str(deb))
+    require(output("dpkg-deb", "-f", str(deb), "Version").strip() == REVIEWED_RELEASE,
+            "The dependency metapackage does not match the managed release")
+    return deb
+
+
+def payload_files():
+    templates = [
+        "anas-update-available-body.html.hbs", "anas-update-available-body.txt.hbs",
+        "anas-update-available-subject.txt.hbs",
+    ]
+    return {
+        STATE / "monitor": SOURCE / "anasctl",
+        SYSTEMD / TIMER: SOURCE / TIMER,
+        SYSTEMD / CHECK_SERVICE: SOURCE / CHECK_SERVICE,
+        **{TEMPLATES / name: SOURCE / name for name in templates},
+    }
+
+
+def stop_monitor():
+    if enabled(TIMER) or active(TIMER):
+        checked_run("systemctl", "disable", "--now", TIMER)
+    if active(CHECK_SERVICE):
+        checked_run("systemctl", "stop", CHECK_SERVICE)
+    require(not enabled(TIMER) and not active(TIMER) and not active(CHECK_SERVICE),
+            "The update monitor did not stop")
+
+
+def monitor_health():
+    require(active(TIMER) and enabled(TIMER), "The daily ANAS timer is not active and enabled")
+
+
+def notification_config():
+    # Read through Proxmox so built-in defaults and legacy matchers are resolved
+    # the same way as in the UI. Export only the information needed for diagnostics.
+    script = r"""
+        my $config = PVE::Notify::read_config();
+        my $users = PVE::Cluster::cfs_read_file('user.cfg')->{users} // {};
+        my $targets = $config->get_targets();
+        for my $target (@$targets) {
+            next if $target->{disable};
+            my $type = $target->{type};
+            next unless $type eq 'sendmail' || $type eq 'smtp';
+            my $getter = "get_${type}_endpoint";
+            my $endpoint = $config->$getter($target->{name});
+            my $recipient = grep { /\S/ } @{$endpoint->{mailto} // []};
+            $recipient ||= grep { (($users->{$_} // {})->{email} // '') =~ /\S/ }
+                @{$endpoint->{'mailto-user'} // []};
+            $target->{has_recipient} = $recipient ? 1 : 0;
+        }
+        my @matchers = map { $config->get_matcher($_->{name}, 1) }
+            grep { !$_->{disable} } @{$config->get_matchers()};
+        print encode_json({
+            hostname => PVE::INotify::nodename(),
+            queued => PVE::RS::Notify->can('enqueue') ? 1 : 0,
+            matchers => \@matchers,
+            targets => $targets,
+        });
+    """
+    result = subprocess.run(
+        ["perl", "-MPVE::Notify", "-MPVE::AccessControl", "-MJSON::PP", "-e", script],
+        capture_output=True, text=True, check=True, timeout=15,
+    )
+    return json.loads(result.stdout)
+
+
+def notice_matches(expression, fields):
+    """Evaluate definite matches; let Proxmox decide time and regex filters."""
+    if "constant" in expression:
+        return expression["constant"]
+    if "not" in expression:
+        result = notice_matches(expression["not"], fields)
+        return None if result is None else not result
+    for operator in ("all-of", "any-of", "one-of"):
+        if operator not in expression:
+            continue
+        results = [notice_matches(rule, fields) for rule in expression[operator]]
+        if operator == "all-of":
+            return False if False in results else None if None in results else True
+        if operator == "any-of":
+            return True if True in results else None if None in results else False
+        if results.count(True) > 1:
+            return False
+        return None if None in results else results.count(True) == 1
+    rule = expression.get("match", {})
+    if rule.get("type") == "severity":
+        return UPDATE_SEVERITY in rule["severities"]
+    if rule.get("type") == "field":
+        value = fields.get(rule["field"])
+        if value is None:
+            return False
+        if "values" in rule:
+            return value in rule["values"]
+    return None
+
+
+def notification_route(config):
+    targets = {target["name"]: target for target in config["targets"] if not target.get("disable")}
+    fields = {"type": UPDATE_EVENT, "hostname": config["hostname"]}
+    possible = set()
+    matched = set()
+    for matcher in config["matchers"]:
+        if matcher.get("disable"):
+            continue
+        selected = set(matcher.get("target", [])) & targets.keys()
+        if not selected:
+            continue
+        expression = matcher.get("expression")
+        result = notice_matches(json.loads(expression), fields) if expression else None
+        if result is True:
+            matched.update(selected)
+        if result is not False:
+            possible.update(selected)
+    if not targets:
+        return False, "Enable or add a target in Datacenter → Notifications. All notification targets are disabled or missing."
+    if not possible:
+        return False, (
+            f"No enabled matcher routes {UPDATE_EVENT} ({UPDATE_SEVERITY}) to an enabled target. "
+            f"In Datacenter → Notifications, enable a suitable default matcher or create one matching type {UPDATE_EVENT}."
+        )
+    deliverable = {name for name in possible if targets[name].get("has_recipient", True)}
+    if not deliverable:
+        return False, (
+            f"The matching mail targets have no recipient with an email address ({', '.join(sorted(possible))}). "
+            "Set an email address on a selected Proxmox user or add a recipient in Datacenter → Notifications."
+        )
+    confirmed = deliverable & matched
+    if confirmed:
+        return True, f"Proxmox has a matching route via {', '.join(sorted(confirmed))}."
+    return None, "Proxmox will evaluate the configured notification filters when the notice is submitted."
+
+
+def notification_diagnostics(verbose=False):
+    try:
+        config = notification_config()
+        if config["queued"] and not active("pve-notify-worker.service"):
+            ready, message = False, "The Proxmox notification worker is inactive. Check pve-notify-worker.service."
+        else:
+            ready, message = notification_route(config)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        print("Warning: Could not inspect notification routing. Review Datacenter → Notifications and test a target.",
+              file=sys.stderr)
+        return True
+    if ready is False:
+        print(f"Warning: {message} Daily release checks still run.", file=sys.stderr)
+        return False
+    if verbose:
+        print(message)
+    return True
+
+
+def start_monitor(scope, manifest):
+    for name, digest in manifest.items():
+        target = Path(name)
+        if target.is_file() and not target.is_symlink() and file_digest(target) == digest:
+            continue
+        require(not os.path.lexists(target), f"Unmanaged file at {target}")
+        data = (scope / "payload" / target.name).read_bytes()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.parent == LEGACY_TEMPLATES:
+            # pmxcfs controls mode and does not support the normal file replacement primitives.
+            template = target.open("xb")
+            try:
+                with template:
+                    template.write(data)
+            except OSError:
+                target.unlink(missing_ok=True)
+                raise
+        else:
+            atomic_write(target, data, 0o755 if target.name == "monitor" else 0o644)
+        require(file_digest(target) == digest, f"Could not verify deployed file {target}")
+    checked_run("systemctl", "daemon-reload")
+    checked_run("systemctl", "enable", "--now", TIMER)
+    monitor_health()
+
+
+def delete_monitor(manifest):
+    for name, digest in manifest.items():
+        target = Path(name)
+        if os.path.lexists(target):
+            require(not target.is_symlink() and file_digest(target) == digest, f"A deployed file was changed externally: {target}")
+    stop_monitor()
+    if (SYSTEMD / TIMER).exists() and (Path("/var/lib/systemd/timers") / f"stamp-{TIMER}").exists():
+        checked_run("systemctl", "clean", "--what=state", TIMER)
+    for name in manifest:
+        Path(name).unlink(missing_ok=True)
+    checked_run("systemctl", "daemon-reload")
+
+
+def ensure_idle():
+    state = output("systemctl", "show", "anasd.service", "-p", "ActiveState", "--value").strip()
+    if state in {"failed", "inactive"}:
+        return
+    require(state == "active", f"Cannot check ANAS jobs while anasd is {state}")
+    for status in ("queued", "running"):
+        jobs = daemon_json(f"jobs?status={status}")["data"]
+        require(isinstance(jobs, list) and not jobs, f"ANAS has {status} jobs. Wait for them to finish before uninstalling.")
+    require(not daemon_json("health")["abandonedCommands"], "ANAS reports unfinished storage commands")
+
+
+def schedule_units():
+    pattern = re.compile(r"anas-(?:(?:snap|backup|repl|cloud)-.+|replcheck|scrub|recycle)\.(?:service|timer)")
+    return sorted(path for path in SYSTEMD.iterdir() if pattern.fullmatch(path.name))
+
+
+def prepare_uninstall(scope):
+    ensure_idle()
+    backup = Path(tempfile.mkdtemp(prefix="uninstall-", dir=scope))
+    schedules = schedule_units()
+    require(all(path.is_file() and not path.is_symlink() for path in schedules), "An ANAS schedule has an unmanaged unit file")
+    changes = [*schedules, Path("/etc/default/anas"), MDADM_CONFIG]
+    changes += [Path("/var/lib/systemd/timers") / f"stamp-{path.name}" for path in schedules if path.suffix == ".timer"]
+    modes = {}
+    for pos, path in enumerate(changes):
+        if path.is_file():
+            copy = backup / str(pos)
+            original = path.stat()
+            atomic_write(copy, path.read_bytes())
+            modes[str(path.resolve())] = {
+                "copy": str(copy), "owner": [original.st_uid, original.st_gid],
+                "mode": stat.S_IMODE(original.st_mode), "mtime_ns": original.st_mtime_ns,
+            }
+    unit_states = {path.name: {"enabled": enabled(path.name), "active": active(path.name)}
+                   for path in schedules if path.suffix == ".timer"}
+    scrub_units = ("mdcheck_start.timer", "mdcheck_continue.timer") if "anas-scrub.timer" in unit_states else ()
+    mdcheck = {unit: {"enabled": enabled(unit), "active": active(unit)} for unit in scrub_units}
+    write_json(backup / "files.json", {"copies": modes, "timers": unit_states, "mdcheck": mdcheck})
+    return backup
+
+
+def restore_unit_state(unit, previous):
+    if enabled(unit) != previous["enabled"]:
+        checked_run("systemctl", "enable" if previous["enabled"] else "disable", unit)
+    if active(unit) != previous["active"]:
+        checked_run("systemctl", "start" if previous["active"] else "stop", unit)
+    require(enabled(unit) == previous["enabled"] and active(unit) == previous["active"],
+            f"Could not restore {unit} to its previous state")
+
+
+def restore_uninstall(scope, backup, manifest, app_changed):
+    saved = read_json(backup / "files.json")
+    if app_changed:
+        mdadm_restored = False
+        for name, metadata in saved["copies"].items():
+            target = Path(name)
+            source = Path(metadata["copy"])
+            content = source.read_bytes()
+            if target == MDADM_CONFIG.resolve():
+                current = target.read_bytes()
+                if current == content:
+                    continue
+                hook = rb"(?im)^pro(?:g(?:r(?:a(?:m)?)?)?)?[ \t]+/usr/local/bin/anas-md-event(?:[ \t\r][^\n]*)?(?:\n|$)"
+                require(current == re.sub(hook, b"", content), "mdadm.conf changed outside the uninstall; its backup was retained")
+                mdadm_restored = True
+            atomic_write(target, content, metadata["mode"])
+            os.chown(target, *metadata["owner"])
+            os.utime(target, ns=(metadata["mtime_ns"], metadata["mtime_ns"]))
+        app_script(scope, "install.sh")
+        if mdadm_restored:
+            checked_run("systemctl", "try-restart", "mdmonitor.service")
+        checked_run("systemctl", "daemon-reload")
+    for unit, previous in (saved["timers"] | saved["mdcheck"]).items():
+        restore_unit_state(unit, previous)
+    retry_health(lambda: app_health(REVIEWED_RELEASE))
+    start_monitor(scope, manifest)
+
+
+def protected_packages(scope):
+    config = read_json(scope / "feature-baseline.json")
+    if config is None:
+        return []
+    current = feature_state()
+    protected = {name for name in config if current[name] != config[name]}
+    iqns = current["targetcli-fb"].get("/sys/kernel/config/target/iscsi", [])
+    if any(name.startswith(("iqn.", "eui.", "naa.")) for name in iqns):
+        protected.add("targetcli-fb")
+    for exports in (Path("/etc/exports"), *Path("/etc/exports.d").glob("*.exports")):
+        if exports.is_file() and any(line.partition("#")[0].strip() for line in exports.read_text(errors="surrogateescape").splitlines()):
+            protected.add("nfs-kernel-server")
+            break
+    listeners = output("ss", "-Htn", "state", "established", "( sport = :445 or sport = :2049 or sport = :3260 )")
+    for line in listeners.splitlines():
+        local = line.split()[-2]
+        protected.update(name for port, name in ((445, "samba"), (2049, "nfs-kernel-server"), (3260, "targetcli-fb"))
+                         if local.endswith(f":{port}"))
+    automatic = {package_name(package) for package in output("apt-mark", "showauto").splitlines()}
+    return sorted(protected & tracked_packages(scope) & installed_packages(package_name) & automatic)
+
+
+def set_package_mark(mark, packages):
+    if not packages:
+        return
+    checked_run("apt-mark", mark, *packages)
+    actual = {package_name(package) for package in output("apt-mark", f"show{mark}").splitlines()}
+    require(set(packages) <= actual, f"APT did not persist all requested {mark} marks")
+
+
+def package_versions():
+    formatted = "${db:Status-Status}\t${binary:Package}\t${Version}\n"
+    packages = output("dpkg-query", "-W", f"-f={formatted}")
+    versions = {}
+    for line in packages.splitlines():
+        state, name, version = line.split("\t")
+        if state == "installed":
+            versions[package_name(name)] = version
+    return versions
+
+
+def archive_identity(archive):
+    fields = output("dpkg-deb", "--showformat=${Package}\t${Architecture}\t${Version}", "--show", str(archive))
+    name, arch, version = fields.split("\t")
+    return package_name(f"{name}:{arch}"), version
+
+
+def cache_removals(scope, backup, targets):
+    versions = package_versions()
+    expected = {(package, versions[package]) for package in targets}
+    available = {}
+    archive_cache = Path("/var/cache/apt/archives")
+    basenames = {name.partition(":")[0] for name in targets}
+    for parent in (scope, scope / "install-cache", archive_cache):
+        for archive in parent.glob("*.deb"):
+            if archive.name.partition("_")[0] not in basenames:
+                continue
+            identity = archive_identity(archive)
+            if identity in expected and identity not in available:
+                if parent == archive_cache:
+                    archive = Path(shutil.copyfile(archive, backup / archive.name))
+                available[identity] = archive
+    missing = sorted(expected - set(available))
+    if missing:
+        print("Caching the exact package versions required for removal rollback.", flush=True)
+        checked_run("apt-get", "download", *(f"{name}={version}" for name, version in missing),
+                    cwd=backup, log=scope / "lifecycle.log")
+        available.update((archive_identity(archive), archive) for archive in backup.glob("*.deb"))
+    require(expected <= set(available), "Some package rollback archives are missing")
+    for archive in available.values():
+        with archive.open("rb") as handle:
+            os.fsync(handle.fileno())
+    sync_directory(backup)
+    automatic = {package_name(package) for package in output("apt-mark", "showauto").splitlines()}
+    return {
+        name: {"version": version, "archive": str(available[name, version]),
+               "sha256": file_digest(available[name, version]), "auto": name in automatic}
+        for name, version in sorted(expected)
+    }
+
+
+def restore_packages(scope, packages):
+    versions = package_versions()
+    missing = {name: record["version"] for name, record in packages.items() if name not in versions}
+    for name in set(packages) - set(missing):
+        require(versions[name] == packages[name]["version"], f"{name} changed versions outside the ANAS operation")
+    if missing:
+        archives = []
+        for name in missing:
+            archive = Path(packages[name]["archive"])
+            require(file_digest(archive) == packages[name]["sha256"], f"The rollback archive for {name} changed")
+            archives.append(archive)
+        _, plan = apt_install_plan(*archives)
+        require(plan == missing, "APT would change packages outside the saved rollback plan")
+        apply_apt(scope, "install", plan, "--no-install-recommends", "--no-remove", "install", *map(str, archives))
+    restored = package_versions()
+    require(all(restored.get(name) == record["version"] for name, record in packages.items()),
+            "The previous package versions were not restored")
+    for mark, automatic in (("manual", False), ("auto", True)):
+        set_package_mark(mark, [name for name, record in packages.items() if record["auto"] == automatic])
+    package_health()
+
+
+def state_files():
+    return STATE / "transaction.json", STATE / "installed.json"
+
+
+def operation_scope(transaction):
+    return STATE / "sessions" / transaction["session"]
+
+
+def set_phase(transaction, phase):
+    transaction["phase"] = phase
+    write_json(state_files()[0], transaction)
+
+
+def finish_transaction():
+    state_files()[0].unlink(missing_ok=True)
+    sync_directory(STATE)
+
+
+def cleanup_packages(scope, targets=None):
+    if targets is None:
+        versions = package_versions()
+        targets = {name: versions[name] for name in dependency_cleanup(scope)}
+    if targets:
+        print("Removing tracked dependencies: " + ", ".join(sorted(targets)), flush=True)
+        apply_apt(scope, "remove", targets, "remove", *targets)
+        require(not (set(targets) & installed_packages(package_name)), "Some planned packages were not removed")
+    package_health()
+
+
+def recover():
+    pending, committed = state_files()
+    transaction = read_json(pending)
+    if transaction is None:
+        print("No ANAS transaction needs recovery.")
+        return
+    scope = operation_scope(transaction)
+    phase = transaction["phase"]
+    manifest = transaction["assets"]
+    print(f"Recovering ANAS transaction {scope.name} ({phase}).", flush=True)
+    if phase in {"dependencies", "install-app"}:
+        installed = read_json(committed)
+        if installed is not None and installed["session"] == scope.name:
+            retry_health(lambda: app_health(REVIEWED_RELEASE))
+            monitor_health()
+        else:
+            if phase == "install-app":
+                delete_monitor(manifest)
+                if app_traces():
+                    remove_app(scope)
+            verify_app_removed()
+            set_package_mark("manual", protected_packages(scope))
+            cleanup_packages(scope)
+    elif phase in {"quiesce", "remove-app", "remove-packages"}:
+        if phase == "remove-packages":
+            restore_packages(scope, transaction["rollback_packages"])
+        set_package_mark("auto", transaction.get("protected", []))
+        restore_uninstall(scope, scope / transaction["backup"], manifest, app_changed=phase != "quiesce")
+    elif phase == "removed":
+        verify_app_removed()
+        require(not (set(transaction["rollback_packages"]) & installed_packages(package_name)), "A removed package reappeared")
+        committed.unlink(missing_ok=True)
+    else:
+        raise RuntimeError(f"Unknown transaction phase {phase}")
+    finish_transaction()
+
+
+def install(plan_only):
+    if plan_only:
+        platform_preflight()
+        with tempfile.TemporaryDirectory(prefix="anas-plan-") as directory:
+            print(apt_install_plan(build_metapackage(Path(directory)))[0], end="")
+        return
+    pending, committed = state_files()
+    require(not pending.exists(), "An ANAS transaction is pending. Run anasctl recover first.")
+    existing = read_json(committed)
+    if existing:
+        app_health(REVIEWED_RELEASE)
+        start_monitor(operation_scope(existing), existing["assets"])
+        notification_diagnostics()
+        print(f"ANAS {REVIEWED_RELEASE} and its daily timer are already healthy.")
+        return
+    platform_preflight()
+    traces = app_traces()
+    traces.extend(map(str, schedule_units()))
+    require(not traces, f"Unmanaged ANAS artifacts already exist: {', '.join(sorted(set(traces)))}")
+    package_health()
+    proxy_health()
+    notification_diagnostics()
+    inventory = installed_packages(package_name)
+    require(METAPACKAGE not in inventory, f"An unmanaged {METAPACKAGE} is already installed")
+    assets = payload_files()
+    for destination in assets:
+        require(not os.path.lexists(destination), f"Unmanaged file at {destination}")
+    sessions = STATE / "sessions"
+    sessions.mkdir(exist_ok=True)
+    scope = Path(tempfile.mkdtemp(prefix="install-", dir=sessions))
+    atomic_write(scope / "initial-packages", ("\n".join(sorted(inventory)) + "\n").encode())
+    (scope / "payload").mkdir()
+    manifest = {}
+    for destination, source in assets.items():
+        payload = scope / "payload" / destination.name
+        shutil.copyfile(source, payload)
+        manifest[str(destination)] = file_digest(payload)
+    shutil.copyfile(SOURCE / "anasctl", scope / "manager")
+    fetch(REVIEWED_RELEASE, scope, REVIEWED_DIGEST)
+    deb = build_metapackage(scope)
+    _, packages = apt_install_plan(deb)
+    require(METAPACKAGE in packages, f"APT must install the managed {METAPACKAGE} package")
+    transaction = {"session": scope.name, "assets": manifest}
+    set_phase(transaction, "dependencies")
+    try:
+        print("Installing the verified APT dependency set.", flush=True)
+        apply_apt(scope, "install", packages, "--no-install-recommends", "--no-remove", "install", str(deb))
+        actual = package_versions()
+        require(all(actual.get(name) == version for name, version in packages.items()), "Some planned dependency versions were not installed")
+        require(set(packages) <= tracked_packages(scope), "The APT guard did not record the complete dependency transaction")
+        package_health()
+        cache = scope / "install-cache"
+        cache.mkdir()
+        cache_removals(scope, cache, packages)
+        write_json(scope / "feature-baseline.json", feature_state())
+        set_phase(transaction, "install-app")
+        app_script(scope, "install.sh")
+        retry_health(lambda: app_health(REVIEWED_RELEASE))
+        start_monitor(scope, manifest)
+        write_json(committed, {"session": scope.name, "version": REVIEWED_RELEASE, "assets": manifest})
+        finish_transaction()
+    except (Exception, KeyboardInterrupt):
+        recover_after_error()
+        raise
+    print(f"Installed and verified ANAS {REVIEWED_RELEASE}. Daily update checks are active.")
+
+
+def uninstall():
+    pending, committed = state_files()
+    require(not pending.exists(), "An ANAS transaction is pending. Run anasctl recover first.")
+    transaction = read_json(committed)
+    if transaction is None:
+        require(not app_traces(), "ANAS is present without a package ledger. This installation is unmanaged.")
+        print("ANAS is already uninstalled.")
+        return
+    scope = operation_scope(transaction)
+    require(transaction["version"] == REVIEWED_RELEASE, "The installed release does not match this manager")
+    require(VERSION_FILE.read_text().strip() == REVIEWED_RELEASE, "The version on disk does not match the managed release")
+    package_health()
+    backup = prepare_uninstall(scope)
+    transaction["backup"] = backup.name
+    set_phase(transaction, "quiesce")
+    try:
+        stop_monitor()
+        for path in schedule_units():
+            if path.suffix == ".timer" and active(path.name):
+                checked_run("systemctl", "stop", path.name)
+        ensure_idle()
+        for path in schedule_units():
+            require(path.suffix != ".service" or not active(path.name), f"Scheduled task {path.name} is still running")
+        protected = protected_packages(scope)
+        if protected:
+            transaction["protected"] = protected
+            set_phase(transaction, "quiesce")
+            print("Preserving configured or in-use dependencies: " + ", ".join(protected), flush=True)
+            set_package_mark("manual", protected)
+        targets = dependency_cleanup(scope)
+        transaction["rollback_packages"] = cache_removals(scope, backup, targets)
+        ensure_idle()
+        set_phase(transaction, "remove-app")
+        remove_app(scope)
+        set_phase(transaction, "remove-packages")
+        cleanup_packages(scope, {name: record["version"] for name, record in transaction["rollback_packages"].items()})
+        delete_monitor(transaction["assets"])
+        set_phase(transaction, "removed")
+        committed.unlink()
+        finish_transaction()
+    except (Exception, KeyboardInterrupt):
+        recover_after_error()
+        raise
+    print(f"Uninstalled ANAS and removed its eligible dependencies. Schedule backups: {scope / transaction['backup']}")
+
+
+def recover_after_error():
+    try:
+        recover()
+    except (Exception, KeyboardInterrupt) as error:
+        print(f"Automatic recovery could not finish: {error}\nRun anasctl recover to retry.", file=sys.stderr)
+
+
+def status():
+    pending, committed = state_files()
+    transaction = read_json(pending)
+    installed = read_json(committed)
+    version = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "absent"
+    print(f"ANAS version on disk: {version}")
+    print(f"Managed installation: {installed['session'] if installed else 'none'}")
+    print(f"Pending operation: {transaction['phase'] if transaction else 'none'}")
+    print(f"Daily update timer: {'active' if active(TIMER) else 'inactive'}")
+    if transaction or installed:
+        print(f"Operation files: {operation_scope(transaction or installed)}")
+    if installed:
+        notification_diagnostics(verbose=True)
+
+
+def locked_operation(command, resend=False):
+    global LOCK_FD
+    require(os.geteuid() == 0, "Run this operation as root")
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = STATE.lstat()
+    require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == 0 and not metadata.st_mode & 0o077,
+            f"Expected a root-owned mode-0700 directory at {STATE}")
+    with (STATE / "operation.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if command == "notify":
+                print("ANAS maintenance is in progress. Skipping this update check.")
+                return
+            raise RuntimeError("Another ANAS operation is in progress") from None
+        LOCK_FD = lock.fileno()
+        try:
+            if command == "notify":
+                if state_files()[0].exists():
+                    print("ANAS recovery is pending. Skipping this update check.")
+                    return
+                check(True, resend=resend)
+            else:
+                {"install": lambda: install(False), "uninstall": uninstall, "recover": recover}[command]()
+        finally:
+            LOCK_FD = None
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "_apt-guard":
+        apt_guard(Path(sys.argv[2]))
+        return
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    install_options = commands.add_parser("install", help=f"install reviewed release {REVIEWED_RELEASE} and activate daily checks")
+    install_options.add_argument("--plan", action="store_true", help="simulate the APT dependency installation")
+    commands.add_parser("uninstall", help="remove ANAS and the eligible packages it introduced")
+    commands.add_parser("recover", help="roll back or finish a pending operation")
+    commands.add_parser("status", help="show the installed version, timer, and pending operation")
+    commands.add_parser("notifications", help="inspect the Proxmox route for ANAS update notices")
+    check_options = commands.add_parser("check", help="compare the installed and latest stable versions")
+    check_options.add_argument("--notify", action="store_true", help="queue one Proxmox notification per release")
+    check_options.add_argument("--resend", action="store_true", help="send the current update notice again (requires --notify)")
+    fetch_options = commands.add_parser("fetch", help="verify and extract a specific release")
+    fetch_options.add_argument("version")
+    fetch_options.add_argument("destination", type=Path, help="existing directory for the verified release")
+    args = parser.parse_args()
+    if args.command == "check" and args.resend and not args.notify:
+        parser.error("--resend requires --notify")
+    for variable in ("APT_CONFIG", "DPKG_ADMINDIR", "DPKG_ROOT"):
+        os.environ.pop(variable, None)
+    os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if args.command == "check":
+        if args.notify:
+            locked_operation("notify", resend=args.resend)
+        else:
+            check(False)
+    elif args.command == "fetch":
+        fetch(args.version, args.destination)
+    elif args.command == "status":
+        status()
+    elif args.command == "notifications":
+        notification_diagnostics(verbose=True)
+    elif args.command == "install" and args.plan:
+        install(True)
+    else:
+        locked_operation(args.command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.CalledProcessError, tarfile.TarError) as error:
+        sys.exit(f"anasctl: {error}")
